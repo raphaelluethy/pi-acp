@@ -1,5 +1,7 @@
 # pi-acp
 
+**Personal fork** — [Raphael Lüthy](https://github.com/raphaelluethy)’s fork of [`svkozak/pi-acp`](https://github.com/svkozak/pi-acp). This repo may diverge from upstream; use the upstream project for the canonical published package and issue tracking unless you are intentionally using this fork.
+
 ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introduction)) adapter for [`pi`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) coding agent (fka shitty coding agent).
 
 `pi-acp` communicates **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed editor) and spawns `pi --mode rpc`, bridging requests/events between the two.

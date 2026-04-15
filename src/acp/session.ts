@@ -3,9 +3,7 @@ import type {
   ContentBlock,
   McpServer,
   SessionUpdate,
-  ToolCallContent,
-  ToolCallLocation,
-  ToolKind
+  ToolCallContent
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { maybeAuthRequiredError } from './auth-required.js'
@@ -13,8 +11,17 @@ import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { SessionStore } from './session-store.js'
-import { toolResultToText } from './translate/pi-tools.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
+import {
+  toolInfoFromPiToolCall,
+  provisionalDiffContentFromFileToolArgs,
+  toolUpdateFromPiToolResult,
+  shellTerminalId,
+  shellExitMeta,
+  formatShellToolResponse,
+  shellToolPresentation,
+  isRejectedToolResult
+} from './tools.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -52,14 +59,6 @@ function findUniqueLineNumber(text: string, needle: string): number | undefined 
     if (text.charCodeAt(i) === 10) line += 1
   }
   return line
-}
-
-function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
-  const path = typeof (args as { path?: unknown } | null | undefined)?.path === 'string' ? (args as { path: string }).path : undefined
-  if (!path) return undefined
-
-  const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
-  return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
 }
 
 export class SessionManager {
@@ -420,31 +419,63 @@ export class PiAcpSession {
                     }
                   })()
 
-            const locations = toToolCallLocations(rawInput, this.cwd)
+            const isShellTool = toolName === 'bash'
+            const info = toolInfoFromPiToolCall(toolName, rawInput ?? {}, this.cwd)
+            const isFileMutationTool = toolName === 'edit' || toolName === 'write'
+
+            // Generate provisional diff content for file mutations
+            const provisional = isFileMutationTool
+              ? provisionalDiffContentFromFileToolArgs(toolName, rawInput ?? {})
+              : []
+
+            // Generate shell presentation if needed
+            const terminalId = isShellTool ? shellTerminalId(toolCallId) : undefined
+            const shellPresentation = isShellTool ? shellToolPresentation(rawInput ?? {}, terminalId) : null
+
             const existingStatus = this.currentToolCalls.get(toolCallId)
-            // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
-            const status = existingStatus ?? 'pending'
+            const status = existingStatus ?? (isFileMutationTool || isShellTool ? 'in_progress' : 'pending')
 
             if (!existingStatus) {
-              this.currentToolCalls.set(toolCallId, 'pending')
+              this.currentToolCalls.set(toolCallId, status)
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: toolName,
-                kind: toToolKind(toolName),
+                title: info.title,
+                kind: info.kind,
                 status,
-                locations,
-                rawInput
+                locations: info.locations,
+                rawInput,
+                content: [...info.content, ...provisional],
+                _meta: {
+                  ...(isShellTool && shellPresentation
+                    ? {
+                        terminal_info: {
+                          terminal_id: terminalId!,
+                          ...(shellPresentation.cwd ? { cwd: shellPresentation.cwd } : {})
+                        }
+                      }
+                    : {})
+                }
               })
             } else {
-              // Best-effort: keep rawInput updated while args are streaming.
-              // Keep the existing status (pending or in_progress).
+              // Best-effort: keep rawInput and title updated while args are streaming.
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
                 status,
-                locations,
-                rawInput
+                title: info.title,
+                locations: info.locations,
+                rawInput,
+                _meta: {
+                  ...(isShellTool && terminalId
+                    ? {
+                        terminal_info: {
+                          terminal_id: terminalId,
+                          cwd: (rawInput as any)?.cd
+                        }
+                      }
+                    : {})
+                }
               })
             }
           }
@@ -459,39 +490,60 @@ export class PiAcpSession {
       case 'tool_execution_start': {
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
-        const args = (ev as any).args
+        const args = (ev as any).args as Record<string, unknown>
+
         let line: number | undefined
 
         // Capture pre-edit file contents so we can emit a structured ACP diff on completion.
-        if (toolName === 'edit') {
-          const p = typeof args?.path === 'string' ? args.path : undefined
-          if (p) {
-            try {
-              const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
-              const oldText = readFileSync(abs, 'utf8')
-              this.editSnapshots.set(toolCallId, { path: p, oldText })
+        // Also compute line number for edit tools when oldText matches uniquely.
+        if (toolName === 'edit' && args?.path) {
+          const p = String(args.path)
+          try {
+            const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
+            const oldText = readFileSync(abs, 'utf8')
+            this.editSnapshots.set(toolCallId, { path: p, oldText })
 
-              const needle = typeof args?.oldText === 'string' ? args.oldText : ''
-              line = findUniqueLineNumber(oldText, needle)
-            } catch {
-              // Ignore snapshot failures; we'll fall back to plain text output.
-            }
+            const needle = typeof args.oldText === 'string' ? args.oldText : ''
+            line = findUniqueLineNumber(oldText, needle)
+          } catch {
+            // Ignore snapshot failures; we'll fall back to plain text output.
           }
         }
 
-        const locations = toToolCallLocations(args, this.cwd, line)
+        const info = toolInfoFromPiToolCall(toolName, args ?? {}, this.cwd, line)
+        const isShellTool = toolName === 'bash'
+        const isFileMutationTool = toolName === 'edit' || toolName === 'write'
+        const terminalId = isShellTool ? shellTerminalId(toolCallId) : undefined
+
+        // Generate provisional diff for file mutations
+        const provisional = isFileMutationTool
+          ? provisionalDiffContentFromFileToolArgs(toolName, args ?? {})
+          : []
+
+        const existingStatus = this.currentToolCalls.get(toolCallId)
 
         // If we already surfaced the tool call while the model streamed it, just transition.
-        if (!this.currentToolCalls.has(toolCallId)) {
+        if (!existingStatus) {
           this.currentToolCalls.set(toolCallId, 'in_progress')
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
-            kind: toToolKind(toolName),
+            title: info.title,
+            kind: info.kind,
             status: 'in_progress',
-            locations,
-            rawInput: args
+            locations: info.locations,
+            rawInput: args,
+            content: [...info.content, ...provisional],
+            _meta: {
+              ...(isShellTool
+                ? {
+                    terminal_info: {
+                      terminal_id: terminalId!,
+                      cwd: (args as any)?.cd
+                    }
+                  }
+                : {})
+            }
           })
         } else {
           this.currentToolCalls.set(toolCallId, 'in_progress')
@@ -499,7 +551,7 @@ export class PiAcpSession {
             sessionUpdate: 'tool_call_update',
             toolCallId,
             status: 'in_progress',
-            locations,
+            locations: info.locations,
             rawInput: args
           })
         }
@@ -511,18 +563,43 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
 
-        const partial = (ev as any).partialResult
-        const text = toolResultToText(partial)
+        const partial = (ev as any).partialResult as Record<string, unknown> | undefined
+        const toolName = String((ev as any).toolName ?? '')
+        const isShellTool = toolName === 'bash'
 
-        this.emit({
-          sessionUpdate: 'tool_call_update',
-          toolCallId,
-          status: 'in_progress',
-          content: text
-            ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-            : undefined,
-          rawOutput: partial
-        })
+        // For shell tools, emit terminal output updates
+        if (isShellTool && partial) {
+          const details = partial.details as Record<string, unknown> | undefined
+          const outputText = String(details?.stdout ?? partial.stdout ?? '')
+          const stderrText = String(details?.stderr ?? partial.stderr ?? '')
+          const combined = [outputText, stderrText].filter(Boolean).join('\n')
+
+          if (combined) {
+            this.emit({
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: 'in_progress',
+              _meta: {
+                terminal_output: {
+                  terminal_id: shellTerminalId(toolCallId),
+                  data: combined
+                }
+              }
+            })
+          }
+        } else if (partial) {
+          // For non-shell tools, use the toolUpdateFromPiToolResult for structured content
+          const info = toolUpdateFromPiToolResult(toolName, {}, partial)
+          if (info.content) {
+            this.emit({
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: 'in_progress',
+              content: info.content,
+              rawOutput: partial
+            })
+          }
+        }
         break
       }
 
@@ -530,16 +607,26 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
 
-        const result = (ev as any).result
+        const result = (ev as any).result as Record<string, unknown>
         const isError = Boolean((ev as any).isError)
-        const text = toolResultToText(result)
+        // toolName may not be present on tool_execution_end events, so try to infer from snapshot
+        const toolName = String((ev as any).toolName ?? '')
+        const args = (ev as any).args as Record<string, unknown>
+        const isShellTool = toolName === 'bash'
+        // Infer edit tool from snapshot presence if toolName is missing
+        const isEditTool = toolName === 'edit' || (!toolName && this.editSnapshots.has(toolCallId))
 
-        // If this was an edit and we captured a snapshot, emit a structured ACP diff.
-        // This enables clients like Zed to render an actual diff UI.
+        // Get structured update info
+        const info = toolUpdateFromPiToolResult(toolName, args ?? {}, result)
+        const isRejected = isRejectedToolResult(result)
+        const status = isError || isRejected ? 'failed' : 'completed'
+
+        // Build content array
+        let content: ToolCallContent[] | undefined = info.content
+
+        // For edit tools with snapshots, prefer the diff content
         const snapshot = this.editSnapshots.get(toolCallId)
-        let content: ToolCallContent[] | undefined
-
-        if (!isError && snapshot) {
+        if (!isError && snapshot && isEditTool) {
           try {
             const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
             const newText = readFileSync(abs, 'utf8')
@@ -550,26 +637,43 @@ export class PiAcpSession {
                   path: snapshot.path,
                   oldText: snapshot.oldText,
                   newText
-                },
-                ...(text ? ([{ type: 'content', content: { type: 'text', text } }] as ToolCallContent[]) : [])
+                }
               ]
             }
           } catch {
-            // ignore; fall back to text only
+            // ignore; fall back to toolUpdateFromPiToolResult content
           }
         }
 
-        // Fallback: just text content.
-        if (!content && text) {
-          content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
-        }
+        // Build _meta for shell tools
+        const shellOutputText = isShellTool
+          ? formatShellToolResponse(result, null)
+          : null
 
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
-          status: isError ? 'failed' : 'completed',
+          status,
           content,
-          rawOutput: result
+          locations: info.locations,
+          rawOutput: result,
+          _meta: {
+            ...(isShellTool
+              ? {
+                  terminal_exit: shellExitMeta(toolCallId, result),
+                  ...(shellOutputText
+                    ? {
+                        toolResponse: [
+                          {
+                            type: 'text',
+                            text: shellOutputText
+                          }
+                        ]
+                      }
+                    : {})
+                }
+              : {})
+          }
         })
 
         this.currentToolCalls.delete(toolCallId)
@@ -669,21 +773,4 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
-}
-
-function toToolKind(toolName: string): ToolKind {
-  switch (toolName) {
-    case 'read':
-      return 'read'
-    case 'write':
-    case 'edit':
-      return 'edit'
-    case 'bash':
-      // Many ACP clients render `execute` tool calls only via the terminal APIs.
-      // Since this adapter lets pi execute locally (no client terminal delegation),
-      // we report bash as `other` so clients show inline text output blocks.
-      return 'other'
-    default:
-      return 'other'
-  }
 }
