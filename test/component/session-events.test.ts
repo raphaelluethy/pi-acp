@@ -104,6 +104,15 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[2]!.update as any).toolCallId, 't1')
   assert.equal((conn.updates[2]!.update as any).status, 'completed')
+  assert.deepEqual((conn.updates[2]!.update as any).content, [
+    {
+      type: 'content',
+      content: {
+        type: 'text',
+        text: '```\ndone\n```'
+      }
+    }
+  ])
 })
 
 test('PiAcpSession: emits tool locations from pi path args', async () => {

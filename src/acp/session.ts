@@ -192,15 +192,16 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private toolCallNames = new Map<string, string>()
 
   // pi can emit multiple `turn_end` events for a single user prompt (e.g. after tool_use).
   // The overall agent loop completes when `agent_end` is emitted.
   private inAgentLoop = false
 
-  // For ACP diff support: capture file contents before edits, then emit ToolCallContent {type:"diff"}.
+  // For ACP diff support: capture file contents before file mutations, then emit ToolCallContent {type:"diff"}.
   // This is due to pi sending diff as a string as opposed to ACP expected diff format.
   // Compatible format may need to be implemented in pi in the future.
-  private editSnapshots = new Map<string, { path: string; oldText: string }>()
+  private fileMutationSnapshots = new Map<string, { path: string; oldText: string | null }>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -419,6 +420,7 @@ export class PiAcpSession {
                     }
                   })()
 
+            this.toolCallNames.set(toolCallId, toolName)
             const isShellTool = toolName === 'bash'
             const info = toolInfoFromPiToolCall(toolName, rawInput ?? {}, this.cwd)
             const isFileMutationTool = toolName === 'edit' || toolName === 'write'
@@ -491,22 +493,25 @@ export class PiAcpSession {
         const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
         const toolName = String((ev as any).toolName ?? 'tool')
         const args = (ev as any).args as Record<string, unknown>
+        this.toolCallNames.set(toolCallId, toolName)
 
         let line: number | undefined
 
-        // Capture pre-edit file contents so we can emit a structured ACP diff on completion.
+        // Capture pre-mutation file contents so we can emit a structured ACP diff on completion.
         // Also compute line number for edit tools when oldText matches uniquely.
-        if (toolName === 'edit' && args?.path) {
+        if ((toolName === 'edit' || toolName === 'write') && args?.path) {
           const p = String(args.path)
           try {
             const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
             const oldText = readFileSync(abs, 'utf8')
-            this.editSnapshots.set(toolCallId, { path: p, oldText })
+            this.fileMutationSnapshots.set(toolCallId, { path: p, oldText })
 
-            const needle = typeof args.oldText === 'string' ? args.oldText : ''
-            line = findUniqueLineNumber(oldText, needle)
+            if (toolName === 'edit') {
+              const needle = typeof args.oldText === 'string' ? args.oldText : ''
+              line = findUniqueLineNumber(oldText, needle)
+            }
           } catch {
-            // Ignore snapshot failures; we'll fall back to plain text output.
+            this.fileMutationSnapshots.set(toolCallId, { path: p, oldText: null })
           }
         }
 
@@ -564,7 +569,7 @@ export class PiAcpSession {
         if (!toolCallId) break
 
         const partial = (ev as any).partialResult as Record<string, unknown> | undefined
-        const toolName = String((ev as any).toolName ?? '')
+        const toolName = String((ev as any).toolName ?? this.toolCallNames.get(toolCallId) ?? '')
         const isShellTool = toolName === 'bash'
 
         // For shell tools, emit terminal output updates
@@ -573,17 +578,24 @@ export class PiAcpSession {
           const outputText = String(details?.stdout ?? partial.stdout ?? '')
           const stderrText = String(details?.stderr ?? partial.stderr ?? '')
           const combined = [outputText, stderrText].filter(Boolean).join('\n')
+          const info = toolUpdateFromPiToolResult(toolName, {}, partial)
 
-          if (combined) {
+          if (combined || info.content) {
             this.emit({
               sessionUpdate: 'tool_call_update',
               toolCallId,
               status: 'in_progress',
+              content: info.content,
+              rawOutput: partial,
               _meta: {
-                terminal_output: {
-                  terminal_id: shellTerminalId(toolCallId),
-                  data: combined
-                }
+                ...(combined
+                  ? {
+                      terminal_output: {
+                        terminal_id: shellTerminalId(toolCallId),
+                        data: combined
+                      }
+                    }
+                  : {})
               }
             })
           }
@@ -610,11 +622,11 @@ export class PiAcpSession {
         const result = (ev as any).result as Record<string, unknown>
         const isError = Boolean((ev as any).isError)
         // toolName may not be present on tool_execution_end events, so try to infer from snapshot
-        const toolName = String((ev as any).toolName ?? '')
+        const toolName = String((ev as any).toolName ?? this.toolCallNames.get(toolCallId) ?? '')
         const args = (ev as any).args as Record<string, unknown>
         const isShellTool = toolName === 'bash'
-        // Infer edit tool from snapshot presence if toolName is missing
-        const isEditTool = toolName === 'edit' || (!toolName && this.editSnapshots.has(toolCallId))
+        const isFileMutationTool =
+          toolName === 'edit' || toolName === 'write' || (!toolName && this.fileMutationSnapshots.has(toolCallId))
 
         // Get structured update info
         const info = toolUpdateFromPiToolResult(toolName, args ?? {}, result)
@@ -624,13 +636,13 @@ export class PiAcpSession {
         // Build content array
         let content: ToolCallContent[] | undefined = info.content
 
-        // For edit tools with snapshots, prefer the diff content
-        const snapshot = this.editSnapshots.get(toolCallId)
-        if (!isError && snapshot && isEditTool) {
+        // For file mutation tools with snapshots, prefer the diff content.
+        const snapshot = this.fileMutationSnapshots.get(toolCallId)
+        if (!isError && snapshot && isFileMutationTool) {
           try {
             const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
             const newText = readFileSync(abs, 'utf8')
-            if (newText !== snapshot.oldText) {
+            if (snapshot.oldText === null || newText !== snapshot.oldText) {
               content = [
                 {
                   type: 'diff',
@@ -677,7 +689,8 @@ export class PiAcpSession {
         })
 
         this.currentToolCalls.delete(toolCallId)
-        this.editSnapshots.delete(toolCallId)
+        this.toolCallNames.delete(toolCallId)
+        this.fileMutationSnapshots.delete(toolCallId)
         break
       }
 
