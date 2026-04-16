@@ -111,6 +111,12 @@ Point your ACP client to the built `dist/index.js`:
   }
 ```
 
+### Environment variables
+
+- `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
+- Default: unset/any other value means `false`.
+- When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
+
 ### Slash commands
 
 `pi-acp` supports slash commands:
